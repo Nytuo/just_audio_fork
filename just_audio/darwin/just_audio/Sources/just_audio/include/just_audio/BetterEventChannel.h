@@ -9,6 +9,9 @@
 
 - (instancetype)initWithName:(NSString*)name messenger:(NSObject<FlutterBinaryMessenger> *)messenger;
 - (void)sendEvent:(id)event;
+
+/// Whether anything is listening. Lets producers skip expensive work for nobody.
+- (BOOL)hasListener;
 - (void)dispose;
 
 @end

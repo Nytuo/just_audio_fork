@@ -25,6 +25,10 @@
     return nil;
 }
 
+- (BOOL)hasListener {
+    return _eventSink != nil;
+}
+
 - (void)sendEvent:(id)event {
     if (!_eventSink) return;
     _eventSink(event);

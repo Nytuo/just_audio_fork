@@ -19,6 +19,11 @@ let package = Package(
             dependencies: [],
             cSettings: [
                 .headerSearchPath("include/just_audio")
+            ],
+            linkerSettings: [
+                // SpectrumTap: vDSP for the FFT, MTAudioProcessingTap for the audio itself.
+                .linkedFramework("Accelerate"),
+                .linkedFramework("MediaToolbox")
             ]
         )
     ]

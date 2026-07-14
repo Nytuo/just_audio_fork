@@ -7,6 +7,7 @@
 #import "./include/just_audio/ConcatenatingAudioSource.h"
 #import "./include/just_audio/LoopingAudioSource.h"
 #import "./include/just_audio/ClippingAudioSource.h"
+#import "./include/just_audio/SpectrumTap.h"
 #import <AVFoundation/AVFoundation.h>
 #import <stdlib.h>
 #include <TargetConditionals.h>
@@ -53,12 +54,14 @@
     NSDictionary<NSString *, NSObject *> *_icyMetadata;
     NSNumber *_errorCode;
     NSString *_errorMessage;
+    SpectrumTap *_spectrumTap;
 }
 
-- (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation {
+- (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation spectrumChannel:(BetterEventChannel *)spectrumChannel {
     self = [super init];
     NSAssert(self, @"super init cannot be nil");
     _registrar = registrar;
+    _spectrumTap = [[SpectrumTap alloc] initWithEventChannel:spectrumChannel];
     _playerId = idParam;
     _useLazyPreparation = useLazyPreparation;
     _methodChannel =
@@ -795,6 +798,9 @@
         switch (status) {
             case AVPlayerItemStatusReadyToPlay: {
                 if (playerItem != _player.currentItem) return;
+                // A remote asset has no audio tracks until it is ready, so the
+                // attach attempted when it became current may have found nothing.
+                [_spectrumTap attachToItem:playerItem];
                 // Detect buffering in different ways depending on whether we're playing
                 if (_playing) {
                     if (@available(macOS 10.12, iOS 10.0, *)) {
@@ -907,6 +913,9 @@
     } else if ([keyPath isEqualToString:@"currentItem"] && _player.currentItem) {
         //NSLog(@"currentItem -> [%d]", [self indexForItem:_player.currentItem]);
         IndexedPlayerItem *playerItem = (IndexedPlayerItem *)change[NSKeyValueChangeNewKey];
+        // The audio mix carrying the spectrum tap belongs to the item, so it has
+        // to be reinstalled every time the queue moves on to the next one.
+        [_spectrumTap attachToItem:playerItem];
         //IndexedPlayerItem *oldPlayerItem = (IndexedPlayerItem *)change[NSKeyValueChangeOldKey];
         if (playerItem.status == AVPlayerItemStatusFailed) {
             [self sendErrorForItem:playerItem];
@@ -1382,6 +1391,8 @@
         }
         _player = nil;
     }
+    [_spectrumTap dispose];
+    _spectrumTap = nil;
     // Untested:
     [_eventChannel dispose];
     [_dataEventChannel dispose];
