@@ -12,6 +12,8 @@
     BetterEventChannel *_channel;
     MTAudioProcessingTapRef _tap;
     __weak AVPlayerItem *_item;
+    // The item whose tracks are still loading; guards against a stale async attach.
+    __weak AVPlayerItem *_pendingItem;
 
     FFTSetup _fftSetup;
     float *_window;
@@ -69,6 +71,7 @@
     AVPlayerItem *item = _item;
     if (item) item.audioMix = nil;
     _item = nil;
+    _pendingItem = nil;
     if (_tap) {
         CFRelease(_tap);
         _tap = NULL;
@@ -76,13 +79,36 @@
 }
 
 - (void)attachToItem:(AVPlayerItem *)item {
-    if (!item || item == _item) return;
+    if (!item || item == _item || item == _pendingItem) return;
+    _pendingItem = item;
 
-    // An HLS asset has no audio tracks to hang a mix off. Nothing to do, and no
-    // point failing loudly: the visualizer just stays empty.
-    AVAssetTrack *track = [[item.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-    if (!track) return;
+    // Loading an asset's tracks reaches out to the network, so it must never be
+    // asked for synchronously: -tracksWithMediaType: would block whatever thread
+    // we are on, and we are called from KVO on the main thread.
+    AVAsset *asset = item.asset;
+    __weak typeof(self) weakSelf = self;
+    [asset loadValuesAsynchronouslyForKeys:@[ @"tracks" ] completionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) self = weakSelf;
+            if (!self) return;
+            // Another item became current while we were loading; that one wins.
+            if (self->_pendingItem != item) return;
+            self->_pendingItem = nil;
 
+            NSError *error = nil;
+            if ([asset statusOfValueForKey:@"tracks" error:&error] != AVKeyValueStatusLoaded) return;
+
+            // An HLS asset exposes no audio tracks to hang a mix off. Nothing to do,
+            // and no point failing loudly: the visualizer just stays empty.
+            AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+            if (!track) return;
+
+            [self installTapForTrack:track onItem:item];
+        });
+    }];
+}
+
+- (void)installTapForTrack:(AVAssetTrack *)track onItem:(AVPlayerItem *)item {
     [self detach];
 
     MTAudioProcessingTapCallbacks callbacks;
