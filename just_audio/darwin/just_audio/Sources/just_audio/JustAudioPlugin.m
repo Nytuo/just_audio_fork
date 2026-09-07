@@ -38,11 +38,15 @@
         NSString *playerId = (NSString *)request[@"id"];
         NSDictionary *loadConfiguration = (NSDictionary *)request[@"audioLoadConfiguration"];
         BOOL useLazyPreparation = [((NSNumber *)request[@"useLazyPreparation"]) boolValue];
+        NSArray *darwinAudioEffects = (NSArray *)request[@"darwinAudioEffects"];
+        if (![darwinAudioEffects isKindOfClass:[NSArray class]]) {
+            darwinAudioEffects = @[];
+        }
         if ([_players objectForKey:playerId] != nil) {
             FlutterError *flutterError = [FlutterError errorWithCode:@"error" message:@"Platform player already exists" details:nil];
             result(flutterError);
         } else {
-            AudioPlayer* player = [[AudioPlayer alloc] initWithRegistrar:_registrar playerId:playerId loadConfiguration:loadConfiguration useLazyPreparation:useLazyPreparation spectrumChannel:_spectrumChannel];
+            AudioPlayer* player = [[AudioPlayer alloc] initWithRegistrar:_registrar playerId:playerId loadConfiguration:loadConfiguration useLazyPreparation:useLazyPreparation spectrumChannel:_spectrumChannel darwinAudioEffects:darwinAudioEffects];
             [_players setValue:player forKey:playerId];
             result(nil);
         }

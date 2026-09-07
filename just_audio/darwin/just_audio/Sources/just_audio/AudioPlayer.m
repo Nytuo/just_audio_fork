@@ -57,11 +57,12 @@
     SpectrumTap *_spectrumTap;
 }
 
-- (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation spectrumChannel:(BetterEventChannel *)spectrumChannel {
+- (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation spectrumChannel:(BetterEventChannel *)spectrumChannel darwinAudioEffects:(NSArray *)darwinAudioEffects {
     self = [super init];
     NSAssert(self, @"super init cannot be nil");
     _registrar = registrar;
     _spectrumTap = [[SpectrumTap alloc] initWithEventChannel:spectrumChannel];
+    [self applyInitialDarwinAudioEffects:darwinAudioEffects];
     _playerId = idParam;
     _useLazyPreparation = useLazyPreparation;
     _methodChannel =
@@ -125,6 +126,24 @@
     return self;
 }
 
+/// Applies the initial state of any Darwin audio effects requested at player
+/// creation (currently just the equalizer). Mirrors what
+/// `decodeAudioEffect()` does on the Android side.
+- (void)applyInitialDarwinAudioEffects:(NSArray *)darwinAudioEffects {
+    for (NSDictionary *effect in darwinAudioEffects) {
+        if (![effect isKindOfClass:[NSDictionary class]]) continue;
+        if (![@"DarwinEqualizer" isEqualToString:effect[@"type"]]) continue;
+        NSArray *bandGains = effect[@"bandGains"];
+        if ([bandGains isKindOfClass:[NSArray class]]) {
+            for (NSUInteger i = 0; i < bandGains.count; i++) {
+                [_spectrumTap setEqualizerBandGain:(NSInteger)i
+                                       gainDecibels:[bandGains[i] floatValue]];
+            }
+        }
+        [_spectrumTap setEqualizerEnabled:(BOOL)[effect[@"enabled"] boolValue]];
+    }
+}
+
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     @try {
         //NSLog(@"method: %@ index=%d", call.method, _index);
@@ -182,6 +201,15 @@
             [self concatenatingMove:(NSString *)request[@"id"] currentIndex:[request[@"currentIndex"] intValue] newIndex:[request[@"newIndex"] intValue] shuffleOrder:(NSArray<NSNumber *> *)request[@"shuffleOrder"]];
             result(@{});
         } else if ([@"setAndroidAudioAttributes" isEqualToString:call.method]) {
+            result(@{});
+        } else if ([@"audioEffectSetEnabled" isEqualToString:call.method]) {
+            if ([@"DarwinEqualizer" isEqualToString:request[@"type"]]) {
+                [_spectrumTap setEqualizerEnabled:(BOOL)[request[@"enabled"] boolValue]];
+            }
+            result(@{});
+        } else if ([@"darwinEqualizerBandSetGain" isEqualToString:call.method]) {
+            [_spectrumTap setEqualizerBandGain:[request[@"bandIndex"] integerValue]
+                                   gainDecibels:(float)[request[@"gain"] doubleValue]];
             result(@{});
         } else {
             result(FlutterMethodNotImplemented);

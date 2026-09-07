@@ -11,7 +11,7 @@
 @property (readonly, nonatomic) AVQueuePlayer *player;
 @property (readonly, nonatomic) float speed;
 
-- (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation spectrumChannel:(BetterEventChannel *)spectrumChannel;
+- (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation spectrumChannel:(BetterEventChannel *)spectrumChannel darwinAudioEffects:(NSArray *)darwinAudioEffects;
 - (void)dispose:(BOOL)calledFromDealloc;
 
 @end

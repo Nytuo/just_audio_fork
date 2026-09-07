@@ -3,6 +3,8 @@
 #import <MediaToolbox/MediaToolbox.h>
 #import <os/log.h>
 #import <stdatomic.h>
+#import <math.h>
+#import <string.h>
 
 // Power of two, and the same window the Android side captures, so both platforms
 // hand Dart comparable resolution.
@@ -14,6 +16,20 @@
 // Nothing redraws faster than the display, so the publisher just samples whatever
 // the newest one is.
 #define kPublishHz 60
+
+// Must match the Dart-side darwinEqualizerCenterFrequencies list exactly (same
+// order, same count) — this native array is the only place these frequencies
+// take effect; the Dart list only describes them to the UI.
+static const double kEQCenterFrequencies[] = {
+    31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
+};
+#define kEQBandCount ((int)(sizeof(kEQCenterFrequencies) / sizeof(kEQCenterFrequencies[0])))
+#define kEQQ 1.0
+// vDSP_biquad requires a delay buffer of 2*sections+2 floats per channel.
+#define kEQDelayLength (2 * kEQBandCount + 2)
+// Provisioned generously above stereo; anything beyond this many channels in
+// a single buffer list silently skips equalization for the extra channels.
+#define kEQMaxChannels 8
 
 static os_log_t spectrumLog(void) {
     static os_log_t log;
@@ -57,6 +73,15 @@ static os_log_t spectrumLog(void) {
     float *_publishBuffer;
 
     double _sampleRate;
+
+    // Equalizer state. The realtime thread only ever atomically loads
+    // _eqEnabled/_eqSetup and reads/writes _eqDelay (which it alone touches);
+    // every other equalizer ivar is written from whichever thread the
+    // platform channel call lands on (never the audio thread).
+    atomic_bool _eqEnabled;
+    float _eqBandGains[kEQBandCount];
+    _Atomic(vDSP_biquad_Setup) _eqSetup;
+    float *_eqDelay[kEQMaxChannels];
 }
 
 - (instancetype)initWithEventChannel:(BetterEventChannel *)channel {
@@ -80,6 +105,13 @@ static os_log_t spectrumLog(void) {
     atomic_init(&_snapshotSampleRate, 44100);
 
     vDSP_hann_window(_window, kFFTSize, vDSP_HANN_NORM);
+
+    atomic_init(&_eqEnabled, false);
+    memset(_eqBandGains, 0, sizeof(_eqBandGains));
+    atomic_init(&_eqSetup, (vDSP_biquad_Setup)NULL);
+    for (int i = 0; i < kEQMaxChannels; i++) {
+        _eqDelay[i] = calloc(kEQDelayLength, sizeof(float));
+    }
     return self;
 }
 
@@ -100,6 +132,16 @@ static os_log_t spectrumLog(void) {
     free(_publishBuffer);
     _window = _windowed = _real = _imag = _magnitudes = _pending = NULL;
     _snapshot = _publishBuffer = NULL;
+
+    vDSP_biquad_Setup setup = atomic_load_explicit(&_eqSetup, memory_order_acquire);
+    if (setup) {
+        vDSP_biquad_DestroySetup(setup);
+        atomic_store_explicit(&_eqSetup, (vDSP_biquad_Setup)NULL, memory_order_release);
+    }
+    for (int i = 0; i < kEQMaxChannels; i++) {
+        free(_eqDelay[i]);
+        _eqDelay[i] = NULL;
+    }
 }
 
 - (void)dealloc {
@@ -266,7 +308,99 @@ static void tapProcess(MTAudioProcessingTapRef tap, CMItemCount numberFrames,
     if (status != noErr) return;
 
     SpectrumTap *self = (__bridge SpectrumTap *)MTAudioProcessingTapGetStorage(tap);
+    // Equalize first so the spectrum (and the audible output) reflect the
+    // filtered signal — bufferListInOut is what MTAudioProcessingTap actually
+    // hands onward to the renderer.
+    [self applyEqualizerToBufferList:bufferListInOut];
     [self consume:bufferListInOut frames:(int)numberFrames];
+}
+
+#pragma mark - Equalizer
+
+- (void)setEqualizerEnabled:(BOOL)enabled {
+    if (enabled && atomic_load_explicit(&_eqSetup, memory_order_acquire) == NULL) {
+        // First-ever enable with no coefficients built yet (e.g. gains were
+        // never touched and are still all zero) — build a flat setup so
+        // enabling doesn't silently do nothing.
+        [self rebuildEqualizerSetup];
+    }
+    atomic_store_explicit(&_eqEnabled, enabled, memory_order_release);
+}
+
+- (void)setEqualizerBandGain:(NSInteger)bandIndex gainDecibels:(float)gain {
+    if (bandIndex < 0 || bandIndex >= kEQBandCount) return;
+    _eqBandGains[bandIndex] = gain;
+    [self rebuildEqualizerSetup];
+}
+
+/// Recomputes all band coefficients (Audio EQ Cookbook peaking filter) and
+/// atomically swaps them in. Never called from the realtime thread; the old
+/// setup is freed after a short grace period so an in-flight tapProcess call
+/// that already loaded the old pointer has time to finish with it.
+- (void)rebuildEqualizerSetup {
+    double coeffs[5 * kEQBandCount];
+    double fs = _sampleRate > 0 ? _sampleRate : 44100;
+    for (int i = 0; i < kEQBandCount; i++) {
+        double f0 = kEQCenterFrequencies[i];
+        double gainDb = _eqBandGains[i];
+        double A = pow(10.0, gainDb / 40.0);
+        double w0 = 2.0 * M_PI * f0 / fs;
+        double alpha = sin(w0) / (2.0 * kEQQ);
+        double cosw0 = cos(w0);
+
+        double b0 = 1.0 + alpha * A;
+        double b1 = -2.0 * cosw0;
+        double b2 = 1.0 - alpha * A;
+        double a0 = 1.0 + alpha / A;
+        double a1 = -2.0 * cosw0;
+        double a2 = 1.0 - alpha / A;
+
+        coeffs[i * 5 + 0] = b0 / a0;
+        coeffs[i * 5 + 1] = b1 / a0;
+        coeffs[i * 5 + 2] = b2 / a0;
+        coeffs[i * 5 + 3] = a1 / a0;
+        coeffs[i * 5 + 4] = a2 / a0;
+    }
+
+    vDSP_biquad_Setup newSetup = vDSP_biquad_CreateSetup(coeffs, kEQBandCount);
+    if (!newSetup) {
+        os_log_error(spectrumLog(), "failed to build equalizer setup");
+        return;
+    }
+
+    vDSP_biquad_Setup oldSetup =
+        atomic_exchange_explicit(&_eqSetup, newSetup, memory_order_acq_rel);
+    if (oldSetup) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            vDSP_biquad_DestroySetup(oldSetup);
+        });
+    }
+}
+
+/// Runs on the realtime audio thread. Filters every channel of [bufferList]
+/// in place, cascading all bands per channel via one vDSP_biquad_Setup.
+/// Allocation-free: coefficients and delay buffers are prebuilt elsewhere.
+- (void)applyEqualizerToBufferList:(AudioBufferList *)bufferList {
+    if (!atomic_load_explicit(&_eqEnabled, memory_order_acquire)) return;
+    vDSP_biquad_Setup setup = atomic_load_explicit(&_eqSetup, memory_order_acquire);
+    if (!setup) return;
+
+    int channelCursor = 0;
+    for (UInt32 b = 0; b < bufferList->mNumberBuffers; b++) {
+        AudioBuffer *buf = &bufferList->mBuffers[b];
+        float *data = (float *)buf->mData;
+        if (!data || buf->mNumberChannels == 0) continue;
+        UInt32 channels = buf->mNumberChannels;
+        UInt32 samplesPerChannel = (buf->mDataByteSize / (UInt32)sizeof(float)) / channels;
+        if (samplesPerChannel == 0) continue;
+        for (UInt32 ch = 0; ch < channels; ch++) {
+            if (channelCursor >= kEQMaxChannels) return;
+            float *delay = _eqDelay[channelCursor++];
+            vDSP_biquad(setup, delay, data + ch, (vDSP_Stride)channels, data + ch,
+                        (vDSP_Stride)channels, samplesPerChannel);
+        }
+    }
 }
 
 #pragma mark - Analysis
