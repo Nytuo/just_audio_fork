@@ -79,6 +79,8 @@ static os_log_t spectrumLog(void) {
     // every other equalizer ivar is written from whichever thread the
     // platform channel call lands on (never the audio thread).
     atomic_bool _eqEnabled;
+    // Set by -dispose. The tap can outlive this object's owner, so the realtime thread checks it.
+    atomic_bool _disposed;
     float _eqBandGains[kEQBandCount];
     _Atomic(vDSP_biquad_Setup) _eqSetup;
     float *_eqDelay[kEQMaxChannels];
@@ -107,6 +109,7 @@ static os_log_t spectrumLog(void) {
     vDSP_hann_window(_window, kFFTSize, vDSP_HANN_NORM);
 
     atomic_init(&_eqEnabled, false);
+    atomic_init(&_disposed, false);
     memset(_eqBandGains, 0, sizeof(_eqBandGains));
     atomic_init(&_eqSetup, (vDSP_biquad_Setup)NULL);
     for (int i = 0; i < kEQMaxChannels; i++) {
@@ -116,8 +119,15 @@ static os_log_t spectrumLog(void) {
 }
 
 - (void)dispose {
+    // The audio thread may still be inside the tap, so nothing it reads is freed here: the tap holds
+    // a strong reference to this object (see tapInit), and -dealloc frees the buffers once the tap has
+    // been finalized.
+    atomic_store_explicit(&_disposed, true, memory_order_release);
     [self detach];
     [self stopPublishing];
+}
+
+- (void)dealloc {
     if (_fftSetup) {
         vDSP_destroy_fftsetup(_fftSetup);
         _fftSetup = NULL;
@@ -142,10 +152,6 @@ static os_log_t spectrumLog(void) {
         free(_eqDelay[i]);
         _eqDelay[i] = NULL;
     }
-}
-
-- (void)dealloc {
-    [self dispose];
 }
 
 - (void)detach {
@@ -285,11 +291,15 @@ static os_log_t spectrumLog(void) {
 
 #pragma mark - Tap callbacks
 
+// The tap can keep running after the player that owns it is gone (it lives as long as the AVPlayerItem's
+// audio mix), so it owns a reference to the SpectrumTap for its whole life.
 static void tapInit(MTAudioProcessingTapRef tap, void *clientInfo, void **tapStorageOut) {
-    *tapStorageOut = clientInfo;
+    *tapStorageOut = (void *)CFBridgingRetain((__bridge id)clientInfo);
 }
 
-static void tapFinalize(MTAudioProcessingTapRef tap) {}
+static void tapFinalize(MTAudioProcessingTapRef tap) {
+    CFRelease(MTAudioProcessingTapGetStorage(tap));
+}
 
 static void tapPrepare(MTAudioProcessingTapRef tap, CMItemCount maxFrames,
                        const AudioStreamBasicDescription *format) {
@@ -308,6 +318,7 @@ static void tapProcess(MTAudioProcessingTapRef tap, CMItemCount numberFrames,
     if (status != noErr) return;
 
     SpectrumTap *self = (__bridge SpectrumTap *)MTAudioProcessingTapGetStorage(tap);
+    if (atomic_load_explicit(&self->_disposed, memory_order_acquire)) return;
     // Equalize first so the spectrum (and the audible output) reflect the
     // filtered signal — bufferListInOut is what MTAudioProcessingTap actually
     // hands onward to the renderer.
