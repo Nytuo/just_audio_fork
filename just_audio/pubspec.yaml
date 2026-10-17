@@ -51,5 +51,7 @@ flutter:
       macos:
         pluginClass: JustAudioPlugin
         sharedDarwinSource: true
+      tvos:
+        pluginClass: JustAudioPlugin
       web:
         default_package: just_audio_web
